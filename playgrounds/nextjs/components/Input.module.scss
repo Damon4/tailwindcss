@@ -1,0 +1,9 @@
+@reference "#config.css";
+
+$-bg-color: green;
+
+.input {
+  padding: 8px;
+  background-color: $-bg-color;
+  @apply border-4 border-red-500 rounded;
+}
