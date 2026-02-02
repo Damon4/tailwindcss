@@ -34,6 +34,7 @@
     "@tailwindcss/node": "workspace:*",
     "@tailwindcss/oxide": "workspace:*",
     "postcss": "^8.4.41",
+    "source-map-js": "^1.2.1",
     "tailwindcss": "workspace:*"
   },
   "devDependencies": {
