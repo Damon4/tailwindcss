@@ -1,10 +1,14 @@
+import path from 'node:path'
 import type * as postcss from 'postcss'
+import { SourceMapConsumer, type RawSourceMap } from 'source-map-js'
 import { atRule, comment, decl, rule, type AstNode } from '../../tailwindcss/src/ast'
 import { createLineTable, type LineTable } from '../../tailwindcss/src/source-maps/line-table'
 import type { Source, SourceLocation } from '../../tailwindcss/src/source-maps/source'
 import { DefaultMap } from '../../tailwindcss/src/utils/default-map'
 
 const EXCLAMATION_MARK = 0x21
+const DEBUG =
+  process.env.DEBUG?.includes('@tailwindcss/postcss') || process.env.DEBUG?.includes('tailwindcss')
 
 export function cssAstToPostCssAst(
   postcss: postcss.Postcss,
@@ -12,8 +16,29 @@ export function cssAstToPostCssAst(
   source?: postcss.Source,
 ): postcss.Root {
   let inputMap = new DefaultMap<Source, postcss.Input>((src) => {
+    let map: postcss.Result['map'] | undefined
+
+    if (source?.input.map && typeof source.input.map.toJSON === 'function') {
+      let sources = source.input.map.toJSON().sources ?? []
+      let file = src.file ?? undefined
+
+      let shouldUseMap = false
+      if (!file) {
+        shouldUseMap = true
+      } else if (sources.includes(file)) {
+        shouldUseMap = true
+      } else {
+        let fileName = path.basename(file)
+        shouldUseMap = sources.some((sourceFile) => path.basename(sourceFile) === fileName)
+      }
+
+      if (shouldUseMap) {
+        map = source.input.map
+      }
+    }
+
     return new postcss.Input(src.code, {
-      map: source?.input.map,
+      map,
       from: src.file ?? undefined,
     })
   })
@@ -124,10 +149,211 @@ export function cssAstToPostCssAst(
 }
 
 export function postCssAstToCssAst(root: postcss.Root): AstNode[] {
-  let inputMap = new DefaultMap<postcss.Input, Source>((input) => ({
-    file: input.file ?? input.id ?? null,
-    code: input.css,
-  }))
+  function getRawMap(input: postcss.Input): RawSourceMap | null {
+    let map = input.map
+    if (!map) return null
+
+    if (typeof map.toJSON === 'function') {
+      return map.toJSON() as RawSourceMap
+    }
+
+    if ('sources' in map) {
+      return map as RawSourceMap
+    }
+
+    if (typeof map === 'object' && map !== null && 'text' in map) {
+      let text = (map as { text?: unknown }).text
+      if (typeof text === 'string') {
+        try {
+          return JSON.parse(text) as RawSourceMap
+        } catch {
+          // Ignore invalid JSON
+        }
+      } else if (text && typeof text === 'object' && 'sources' in (text as object)) {
+        return text as RawSourceMap
+      }
+    }
+
+    DEBUG &&
+      console.warn('[tw-postcss:sourcemap] unrecognized input.map', {
+        inputFile: input.file ?? input.id ?? null,
+        mapType: typeof map,
+        mapKeys: typeof map === 'object' && map !== null ? Object.keys(map as object) : null,
+      })
+
+    return null
+  }
+
+  let rawMapCache = new DefaultMap<postcss.Input, RawSourceMap | null>((input) => getRawMap(input))
+
+  let consumerCache = new DefaultMap<postcss.Input, SourceMapConsumer | null>((input) => {
+    let rawMap = rawMapCache.get(input)
+    if (!rawMap) return null
+    return new SourceMapConsumer(rawMap)
+  })
+
+  function normalizeSourceName(source: string) {
+    let cleaned = source
+    let queryIndex = cleaned.indexOf('?')
+    if (queryIndex !== -1) cleaned = cleaned.slice(0, queryIndex)
+    let hashIndex = cleaned.indexOf('#')
+    if (hashIndex !== -1) cleaned = cleaned.slice(0, hashIndex)
+
+    if (cleaned.startsWith('file://')) {
+      try {
+        return decodeURIComponent(new URL(cleaned).pathname)
+      } catch {
+        return cleaned.slice('file://'.length)
+      }
+    }
+    if (/^[a-z]+:\/\//i.test(cleaned)) {
+      cleaned = cleaned.replace(/^[a-z]+:\/\//i, '')
+      cleaned = cleaned.replace(/^\/+/, '')
+    }
+
+    cleaned = cleaned.replace(/\/\.(?=\/)/g, '')
+
+    if (cleaned.startsWith('./')) cleaned = cleaned.slice(2)
+
+    return cleaned
+  }
+
+  let sourcesContentCache = new DefaultMap<postcss.Input, Map<string, string | null>>((input) => {
+    let map = new Map<string, string | null>()
+
+    let consumer = consumerCache.get(input)
+    if (consumer) {
+      for (let source of consumer.sources) {
+        let content: string | null
+        try {
+          content = consumer.sourceContentFor(source, true) ?? null
+        } catch {
+          content = null
+        }
+        map.set(source, content)
+      }
+      return map
+    }
+
+    let rawMap = rawMapCache.get(input)
+    let sources = rawMap?.sources ?? []
+    let contents = rawMap?.sourcesContent ?? []
+
+    for (let i = 0; i < sources.length; i++) {
+      map.set(sources[i], contents[i] ?? null)
+    }
+
+    return map
+  })
+
+  let normalizedSourcesCache = new DefaultMap<postcss.Input, Map<string, string>>((input) => {
+    let map = new Map<string, string>()
+
+    let consumer = consumerCache.get(input)
+    let sources = consumer?.sources ?? rawMapCache.get(input)?.sources ?? []
+
+    for (let source of sources) {
+      let normalized = normalizeSourceName(source)
+      map.set(source, source)
+      map.set(normalized, source)
+      map.set(path.basename(source), source)
+      map.set(path.basename(normalized), source)
+    }
+
+    return map
+  })
+
+  function resolveSourceContent(input: postcss.Input, file: string) {
+    let rawMap = rawMapCache.get(input)
+    if (!rawMap) {
+      DEBUG &&
+        console.warn('[tw-postcss:sourcemap] missing raw map', {
+          file,
+          inputFile: input.file ?? input.id ?? null,
+        })
+      return {
+        sourceName: file,
+        content: null as string | null,
+      }
+    }
+
+    let normalizedSources = normalizedSourcesCache.get(input)
+    let matchedSource = normalizedSources.get(file)
+    if (!matchedSource) {
+      let normalized = normalizeSourceName(file)
+      matchedSource =
+        normalizedSources.get(normalized) ??
+        normalizedSources.get(path.basename(normalized)) ??
+        normalizedSources.get(path.basename(file))
+
+      if (!matchedSource) {
+        for (let [key, value] of normalizedSources) {
+          if (key.endsWith(normalized) || normalized.endsWith(key)) {
+            matchedSource = value
+            break
+          }
+        }
+      }
+    }
+
+    let sourceName = matchedSource ?? file
+    let content = sourcesContentCache.get(input).get(sourceName) ?? null
+
+    if (input.file) {
+      let inputBase = path.basename(input.file)
+      let sourceBase = path.basename(sourceName)
+
+      if (inputBase === sourceBase) {
+        let normalizedSource = normalizeSourceName(sourceName)
+        if (normalizedSource === sourceBase) {
+          sourceName = input.file
+        }
+      }
+    }
+
+    if (DEBUG) {
+      let normalized = normalizeSourceName(file)
+      let sources = consumerCache.get(input)?.sources ?? rawMap.sources
+      console.warn('[tw-postcss:sourcemap] resolve', {
+        file,
+        normalized,
+        matchedSource: matchedSource ?? null,
+        sourceName,
+        hasContent: content !== null,
+        sourcesCount: sources.length,
+      })
+    }
+
+    return {
+      sourceName,
+      content,
+    }
+  }
+
+  let sourceObjectCache = new DefaultMap<postcss.Input, DefaultMap<string, Source>>(
+    (input) =>
+      new DefaultMap((file) => {
+        let { sourceName, content } = resolveSourceContent(input, file)
+        return {
+          file: sourceName,
+          code: content ?? input.css,
+        }
+      }),
+  )
+
+  let inputMap = new DefaultMap<postcss.Input, Source>((input) => {
+    let file = input.file ?? input.id ?? null
+
+    let rawMap = rawMapCache.get(input)
+    if (rawMap && rawMap.sources.length > 0) {
+      file = rawMap.sources[0]
+    }
+
+    return {
+      file,
+      code: input.css,
+    }
+  })
 
   function toSource(node: postcss.ChildNode): SourceLocation | undefined {
     let source = node.source
@@ -137,6 +363,103 @@ export function postCssAstToCssAst(root: postcss.Root): AstNode[] {
     if (!input) return
     if (source.start === undefined) return
     if (source.end === undefined) return
+
+    let consumer = consumerCache.get(input)
+
+    if (DEBUG && !consumer) {
+      let rawMap = rawMapCache.get(input)
+      console.warn('[tw-postcss:sourcemap] no consumer', {
+        inputFile: input.file ?? input.id ?? null,
+        hasRawMap: rawMap !== null,
+        sourcesCount: rawMap?.sources?.length ?? 0,
+        sourcesContentCount: rawMap?.sourcesContent?.length ?? 0,
+        sourceRoot: rawMap?.sourceRoot ?? null,
+      })
+    }
+
+    if (consumer) {
+      let start = consumer.originalPositionFor(
+        {
+          line: source.start.line,
+          column: Math.max(source.start.column - 1, 0),
+        },
+        SourceMapConsumer.LEAST_UPPER_BOUND,
+      )
+      let end = consumer.originalPositionFor(
+        {
+          line: source.end.line,
+          column: Math.max(source.end.column - 1, 0),
+        },
+        SourceMapConsumer.GREATEST_LOWER_BOUND,
+      )
+
+      if (!end.source) {
+        let endUpper = consumer.originalPositionFor(
+          {
+            line: source.end.line,
+            column: Math.max(source.end.column - 1, 0),
+          },
+          SourceMapConsumer.LEAST_UPPER_BOUND,
+        )
+
+        if (endUpper.source) {
+          end = endUpper
+        }
+      }
+
+      if (!start.source) {
+        let startLower = consumer.originalPositionFor(
+          {
+            line: source.start.line,
+            column: Math.max(source.start.column - 1, 0),
+          },
+          SourceMapConsumer.GREATEST_LOWER_BOUND,
+        )
+
+        if (startLower.source) {
+          start = startLower
+        }
+      }
+
+      if (start.source && !end.source) {
+        end = start
+      } else if (!start.source && end.source) {
+        start = end
+      }
+
+      if (DEBUG && (!start.source || !end.source)) {
+        let rawMap = rawMapCache.get(input)
+        console.warn('[tw-postcss:sourcemap] missing original source', {
+          inputFile: input.file ?? input.id ?? null,
+          start,
+          end,
+          sourcesCount: rawMap?.sources?.length ?? 0,
+          sourcesContentCount: rawMap?.sourcesContent?.length ?? 0,
+          sourceRoot: rawMap?.sourceRoot ?? null,
+        })
+      }
+
+      if (start.source && end.source) {
+        let file = start.source
+        let sourceObject = sourceObjectCache.get(input).get(file)
+        let table = createLineTable(sourceObject.code)
+
+        let startOffset = table.findOffset({
+          line: start.line ?? 1,
+          column: start.column ?? 0,
+        })
+        let endOffset = table.findOffset({
+          line: end.line ?? 1,
+          column: end.column ?? 0,
+        })
+
+        if (endOffset < startOffset) {
+          endOffset = startOffset
+        }
+
+        return [sourceObject, startOffset, endOffset]
+      }
+    }
 
     return [inputMap.get(input), source.start.offset, source.end.offset]
   }
