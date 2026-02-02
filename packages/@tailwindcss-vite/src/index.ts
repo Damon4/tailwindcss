@@ -35,7 +35,7 @@ export default function tailwindcss(opts: PluginOptions = {}): Plugin[] {
   let shouldOptimize = true
   let minify = true
 
-  function createRoot(env: Environment | null, id: string) {
+  function createResolvers(env: Environment | null) {
     type ResolveFn = (id: string, base: string) => Promise<string | false | undefined>
 
     let customCssResolver: ResolveFn
@@ -73,6 +73,12 @@ export default function tailwindcss(opts: PluginOptions = {}): Plugin[] {
       customCssResolver = (id: string, base: string) => cssResolver(env, id, base, true)
       customJsResolver = (id: string, base: string) => jsResolver(env, id, base, true)
     }
+
+    return { customCssResolver, customJsResolver }
+  }
+
+  function createRoot(env: Environment | null, id: string) {
+    let { customCssResolver, customJsResolver } = createResolvers(env)
 
     return new Root(
       id,
@@ -113,6 +119,44 @@ export default function tailwindcss(opts: PluginOptions = {}): Plugin[] {
         if (typeof opts.optimize === 'object') {
           minify = opts.optimize.minify !== false
         }
+      },
+    },
+
+    {
+      // Step 1.5: Resolve @apply in non-root stylesheets (e.g. CSS modules)
+      name: '@tailwindcss/vite:apply',
+      enforce: 'pre',
+      transform: {
+        filter: {
+          id: {
+            exclude: [/\/\.vite\//, SPECIAL_QUERY_RE, COMMON_JS_PROXY_RE],
+            include: [/\.(?:css|scss|sass)(?:\?.*)?$/],
+          },
+        },
+        async handler(src, id) {
+          if (!config) return
+          if (isPotentialCssRootFile(id)) return
+          if (hasTailwindRootDirective(src)) return
+
+          let inputBase = path.dirname(path.resolve(idToPath(id)))
+          let { customCssResolver, customJsResolver } = createResolvers(this.environment ?? null)
+
+          let compiler = await compile(src, {
+            from: config.css.devSourcemap ? id : undefined,
+            base: inputBase,
+            shouldRewriteUrls: true,
+            onDependency: (file) => this.addWatchFile(file),
+            customCssResolver,
+            customJsResolver,
+          })
+
+          if (!(compiler.features & Features.AtApply)) return
+
+          return {
+            code: compiler.build([]),
+            map: config.css.devSourcemap ? toSourceMap(compiler.buildSourceMap()).raw : null,
+          }
+        },
       },
     },
 
@@ -218,6 +262,11 @@ function isPotentialCssRootFile(id: string) {
 
   return isCssFile
 }
+
+function hasTailwindRootDirective(src: string) {
+  return /@tailwind\b/.test(src) || /@import\s+['"]tailwindcss(?:\/[^'"]+)?['"]/.test(src)
+}
+
 
 function idToPath(id: string) {
   return path.resolve(id.replace(/\?.*$/, ''))

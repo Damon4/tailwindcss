@@ -11,12 +11,14 @@ import { clearRequireCache } from '@tailwindcss/node/require-cache'
 import { Scanner } from '@tailwindcss/oxide'
 import fs from 'node:fs'
 import path, { relative } from 'node:path'
-import type { AcceptedPlugin, PluginCreator, Postcss, Root } from 'postcss'
+import type { AcceptedPlugin, AtRule, ChildNode, PluginCreator, Postcss, Root, Rule } from 'postcss'
 import { toCss, type AstNode } from '../../tailwindcss/src/ast'
 import { cssAstToPostCssAst, postCssAstToCssAst } from './ast'
 import fixRelativePathsPlugin from './postcss-fix-relative-paths'
 
 const DEBUG = env.DEBUG
+const DEBUG_MAP =
+  process.env.DEBUG?.includes('@tailwindcss/postcss') || process.env.DEBUG?.includes('tailwindcss')
 
 interface CacheEntry {
   mtimes: Map<string, number>
@@ -73,13 +75,65 @@ function tailwindcss(opts: PluginOptions = {}): AcceptedPlugin {
   let optimize = opts.optimize ?? process.env.NODE_ENV === 'production'
   let shouldRewriteUrls = opts.transformAssetUrls ?? true
 
+  function normalizeVariantAtRules(root: Root) {
+    function isRule(node: ChildNode): node is Rule {
+      return node.type === 'rule'
+    }
+
+    function isAtRule(node: ChildNode): node is AtRule {
+      return node.type === 'atrule'
+    }
+
+    root.walkAtRules('variant', (atRule) => {
+      if (!atRule.nodes || atRule.nodes.length === 0) return
+
+      let ruleNodes = atRule.nodes.filter(isRule)
+      if (ruleNodes.length === 0) return
+
+      let nestedVariantNodes = atRule.nodes.filter(
+        (node): node is AtRule => isAtRule(node) && node.name === 'variant',
+      )
+
+      let convertedRules = ruleNodes.map((rule) => {
+        let nextAtRule = atRule.clone({ nodes: [] }) as AtRule
+
+        for (let child of rule.nodes ?? []) {
+          nextAtRule.append(child.clone())
+        }
+
+        for (let nested of nestedVariantNodes) {
+          if (!nested.nodes) continue
+
+          let nestedRule = nested.nodes.find(
+            (node): node is Rule => isRule(node) && node.selector === rule.selector,
+          )
+
+          if (!nestedRule) continue
+
+          let nestedClone = nested.clone({ nodes: [] }) as AtRule
+          for (let child of nestedRule.nodes ?? []) {
+            nestedClone.append(child.clone())
+          }
+          nextAtRule.append(nestedClone)
+        }
+
+        rule.removeAll()
+        rule.append(nextAtRule)
+        return rule
+      })
+
+      atRule.replaceWith(...convertedRules)
+      return false
+    })
+  }
+
   return {
     postcssPlugin: '@tailwindcss/postcss',
     plugins: [
       // We need to handle the case where `postcss-import` might have run before
       // the Tailwind CSS plugin is run. In this case, we need to manually fix
       // relative paths before processing it in core.
-      fixRelativePathsPlugin(),
+      // fixRelativePathsPlugin(),
 
       {
         postcssPlugin: 'tailwindcss',
@@ -87,9 +141,46 @@ function tailwindcss(opts: PluginOptions = {}): AcceptedPlugin {
           using I = new Instrumentation()
 
           let inputFile = result.opts.from ?? ''
-          let isCSSModuleFile = inputFile.endsWith('.module.css')
+          if (DEBUG_MAP) {
+            let map = result.opts.map as undefined | { prev?: unknown } | true
+            console.warn('[tw-postcss:sourcemap] input', {
+              from: inputFile,
+              hasInputMap: Boolean(root.source?.input.map),
+              hasMapPrev: Boolean(map && typeof map === 'object' && 'prev' in map && map.prev),
+              mapType: map === true ? 'true' : typeof map,
+            })
+          }
+
+          // Rspack can pass previous maps via result.opts.map.prev without
+          // populating root.source.input.map. Hydrate it so our mapper can
+          // access the original sources.
+          if (root.source?.input && !root.source.input.map) {
+            let map = result.opts.map as undefined | { prev?: unknown } | true
+            let prev = map && typeof map === 'object' && 'prev' in map ? map.prev : undefined
+
+            if (prev) {
+              try {
+                let newInput = new postcss.Input(root.source.input.css, {
+                  from: root.source.input.file ?? undefined,
+                  map: { prev },
+                })
+                root.source.input = newInput
+              } catch (error) {
+                DEBUG_MAP &&
+                  console.warn('[tw-postcss:sourcemap] failed to hydrate input map', {
+                    from: inputFile,
+                    error,
+                  })
+              }
+            }
+          }
+          let isCSSModuleFile =
+            inputFile.endsWith('.module.css') ||
+            inputFile.endsWith('.module.scss') ||
+            inputFile.endsWith('.module.sass')
 
           DEBUG && I.start(`[@tailwindcss/postcss] ${relative(base, inputFile)}`)
+          let hasTailwindDirective = false
 
           // Bail out early if this is guaranteed to be a non-Tailwind CSS file.
           {
@@ -101,18 +192,25 @@ function tailwindcss(opts: PluginOptions = {}): AcceptedPlugin {
                 node.name === 'reference' ||
                 node.name === 'theme' ||
                 node.name === 'variant' ||
+                node.name === 'custom-variant' ||
+                node.name === 'utility' ||
                 node.name === 'config' ||
                 node.name === 'plugin' ||
                 node.name === 'apply' ||
                 node.name === 'tailwind'
               ) {
                 canBail = false
+                hasTailwindDirective = true
                 return false
               }
             })
             if (canBail) return
             DEBUG && I.end('Quick bail check')
           }
+
+          // Sass can bubble nested @variant rules to the top-level. Normalize
+          // them back into nested form so variants apply to local selectors.
+          normalizeVariantAtRules(root)
 
           let context = getContextFromCache(postcss, inputFile, opts)
           let inputBasePath = path.dirname(path.resolve(inputFile))
@@ -155,7 +253,7 @@ function tailwindcss(opts: PluginOptions = {}): AcceptedPlugin {
             // guarantee a `build()` function is available.
             context.compiler ??= createCompiler()
 
-            if ((await context.compiler).features === Features.None) {
+            if ((await context.compiler).features === Features.None && !hasTailwindDirective) {
               return
             }
 
