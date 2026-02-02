@@ -1,0 +1,8 @@
+@reference "#config.css";
+
+.button {
+    --bg-color: blue;
+    @apply text-white rounded;
+    padding: 10px;
+    background: var(--bg-color);
+}
