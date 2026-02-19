@@ -44,7 +44,15 @@
     "bench": "vitest bench",
     "version-packages": "node ./scripts/version-packages.mjs",
     "vite": "pnpm run --filter=vite-playground dev",
-    "nextjs": "pnpm run --filter=nextjs-playground dev"
+    "vite:build": "pnpm run --filter=vite-playground build",
+    "nextjs": "pnpm run --filter=nextjs-playground dev",
+    "nextjs:webpack": "pnpm run --filter=nextjs-playground dev -- --webpack",
+    "nextjs:build": "pnpm run --filter=nextjs-playground build",
+    "nextjs:webpack:build": "pnpm run --filter=nextjs-playground build -- --webpack",
+    "webpack": "pnpm run --filter=webpack-playground dev",
+    "webpack:build": "pnpm run --filter=webpack-playground build",
+    "rspack": "pnpm run --filter=rspack-playground dev",
+    "rspack:build": "pnpm run --filter=rspack-playground build"
   },
   "license": "MIT",
   "devDependencies": {

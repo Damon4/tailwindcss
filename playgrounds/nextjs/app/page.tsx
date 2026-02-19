@@ -1,5 +1,5 @@
-import styles from './page.module.css'
+import { App } from '@/components/App'
 
 export default function Home() {
-  return <h1 className={styles.heading}>Hello world!</h1>
+  return <App />
 }
