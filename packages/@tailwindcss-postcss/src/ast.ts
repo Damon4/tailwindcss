@@ -1,10 +1,63 @@
 import type * as postcss from 'postcss'
+import { URL } from 'node:url'
 import { atRule, comment, decl, rule, type AstNode } from '../../tailwindcss/src/ast'
 import { createLineTable, type LineTable } from '../../tailwindcss/src/source-maps/line-table'
 import type { Source, SourceLocation } from '../../tailwindcss/src/source-maps/source'
 import { DefaultMap } from '../../tailwindcss/src/utils/default-map'
 
 const EXCLAMATION_MARK = 0x21
+
+function stripQueryParam(id: string, param: string) {
+  let hashIndex = id.indexOf('#')
+  let hash = hashIndex === -1 ? '' : id.slice(hashIndex)
+  let withoutHash = hashIndex === -1 ? id : id.slice(0, hashIndex)
+
+  let queryIndex = withoutHash.indexOf('?')
+  if (queryIndex === -1) return id
+
+  let base = withoutHash.slice(0, queryIndex)
+  let query = withoutHash.slice(queryIndex + 1)
+
+  let parts = query.split('&').filter(Boolean)
+  let filtered = parts.filter((p) => !(p === param || p.startsWith(`${param}=`)))
+
+  return (filtered.length > 0 ? `${base}?${filtered.join('&')}` : base) + hash
+}
+
+function normalizeSourceFile(file: string | null): string | null {
+  if (file === null) return null
+
+  // Vite/webpack/rspack commonly append a cache-busting `?t=...` during HMR.
+  // Strip only that parameter; keep all other query params intact.
+  let normalized = stripQueryParam(file, 't')
+
+  // If this is a URL-like source (e.g. webpack://, rspack://), keep it as-is.
+  // DevTools uses these schemes to associate sources and enable navigation
+  // from Elements -> Sources.
+  if (/^[a-zA-Z][a-zA-Z+.-]*:\/\//.test(normalized)) {
+    // But strip cache-busting search/hash from file:// URLs while keeping the
+    // file URL itself.
+    if (normalized.startsWith('file://')) {
+      try {
+        let url = new URL(normalized)
+        url.searchParams.delete('t')
+        return url.href
+      } catch {
+        return normalized
+      }
+    }
+
+    return normalized
+  }
+
+  // Only strip query/hash when this looks like a filesystem path.
+  // This keeps virtual module ids (e.g. `virtual:foo?bar`) intact.
+  // For path-like sources we intentionally keep any remaining query/hash.
+  // Bundlers may use them to encode module identity, which DevTools relies on
+  // for navigation from Elements -> Sources.
+
+  return normalized
+}
 
 export function cssAstToPostCssAst(
   postcss: postcss.Postcss,
@@ -125,7 +178,7 @@ export function cssAstToPostCssAst(
 
 export function postCssAstToCssAst(root: postcss.Root): AstNode[] {
   let inputMap = new DefaultMap<postcss.Input, Source>((input) => ({
-    file: input.file ?? input.id ?? null,
+    file: normalizeSourceFile(input.file ?? input.id ?? null),
     code: input.css,
   }))
 

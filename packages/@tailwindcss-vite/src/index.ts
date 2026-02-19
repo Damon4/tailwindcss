@@ -19,6 +19,29 @@ const SPECIAL_QUERY_RE = /[?&](?:worker|sharedworker|raw|url)\b/
 const COMMON_JS_PROXY_RE = /\?commonjs-proxy/
 const INLINE_STYLE_ID_RE = /[?&]index\=\d+\.css$/
 
+// Vite appends a cache-busting timestamp query (`?t=...`) to module URLs during
+// HMR updates. We must ignore it when caching Roots and when generating source
+// maps, otherwise the browser/devtools can lose the association with the
+// original source file after hot reload.
+function stripViteTimestampQuery(id: string) {
+  let hashIndex = id.indexOf('#')
+  let hash = hashIndex === -1 ? '' : id.slice(hashIndex)
+  let withoutHash = hashIndex === -1 ? id : id.slice(0, hashIndex)
+
+  let queryIndex = withoutHash.indexOf('?')
+  if (queryIndex === -1) return id
+
+  let base = withoutHash.slice(0, queryIndex)
+  let query = withoutHash.slice(queryIndex + 1)
+
+  // Keep the original query encoding/shape (e.g. `&lang.css`) by operating on
+  // raw segments rather than URLSearchParams.
+  let parts = query.split('&').filter(Boolean)
+  let filtered = parts.filter((p) => !p.startsWith('t='))
+
+  return (filtered.length > 0 ? `${base}?${filtered.join('&')}` : base) + hash
+}
+
 export type PluginOptions = {
   /**
    * Optimize and minify the output CSS.
@@ -131,19 +154,21 @@ export default function tailwindcss(opts: PluginOptions = {}): Plugin[] {
         async handler(src, id) {
           if (!isPotentialCssRootFile(id)) return
 
+          let stableId = stripViteTimestampQuery(id)
+
           using I = new Instrumentation()
           DEBUG && I.start('[@tailwindcss/vite] Generate CSS (serve)')
 
           let roots = rootsByEnv.get(this.environment?.name ?? 'default')
-          let root = roots.get(id)
+          let root = roots.get(stableId)
           if (!root) {
-            root ??= createRoot(this.environment ?? null, id)
-            roots.set(id, root)
+            root ??= createRoot(this.environment ?? null, stableId)
+            roots.set(stableId, root)
           }
 
           let result = await root.generate(src, (file) => this.addWatchFile(file), I)
           if (!result) {
-            roots.delete(id)
+            roots.delete(stableId)
             return src
           }
 
@@ -168,19 +193,21 @@ export default function tailwindcss(opts: PluginOptions = {}): Plugin[] {
         async handler(src, id) {
           if (!isPotentialCssRootFile(id)) return
 
+          let stableId = stripViteTimestampQuery(id)
+
           using I = new Instrumentation()
           DEBUG && I.start('[@tailwindcss/vite] Generate CSS (build)')
 
           let roots = rootsByEnv.get(this.environment?.name ?? 'default')
-          let root = roots.get(id)
+          let root = roots.get(stableId)
           if (!root) {
-            root ??= createRoot(this.environment ?? null, id)
-            roots.set(id, root)
+            root ??= createRoot(this.environment ?? null, stableId)
+            roots.set(stableId, root)
           }
 
           let result = await root.generate(src, (file) => this.addWatchFile(file), I)
           if (!result) {
-            roots.delete(id)
+            roots.delete(stableId)
             return src
           }
           DEBUG && I.end('[@tailwindcss/vite] Generate CSS (build)')

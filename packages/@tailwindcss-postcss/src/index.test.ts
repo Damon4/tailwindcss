@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promise
 import { tmpdir } from 'node:os'
 import path from 'path'
 import postcss from 'postcss'
+import { SourceMapConsumer, type RawSourceMap } from 'source-map-js'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import tailwindcss from './index'
 
@@ -18,6 +19,63 @@ function inputCssFilePath() {
 }
 
 const css = dedent
+
+function findLineAndColumn(content: string, needle: string): { line: number; column: number } {
+  let index = content.indexOf(needle)
+  if (index === -1) {
+    throw new Error(`Could not find '${needle}' in generated CSS`)
+  }
+
+  // Source maps use 1-based lines and 0-based columns.
+  let before = content.slice(0, index)
+  let lines = before.split('\n')
+  let line = lines.length
+  let column = lines.at(-1)?.length ?? 0
+  return { line, column }
+}
+
+async function expectMapsBackTo(
+  result: postcss.Result,
+  expectedSource: string,
+) {
+  expect(result.map).toBeTruthy()
+
+  let raw = result.map!.toJSON() as RawSourceMap
+  let sources = (raw.sources ?? []).map((s) => s.replaceAll('\\', '/'))
+  let normalizedExpected = expectedSource.replaceAll('\\', '/')
+
+  let isUrlLike = /^[a-zA-Z][a-zA-Z+.-]*:\/\//.test(normalizedExpected)
+  let expectedBasename = normalizedExpected.split('/').at(-1) ?? normalizedExpected
+
+  let matchesExpected = (s: string | null | undefined) => {
+    if (!s) return false
+    let normalized = s.replaceAll('\\', '/')
+
+    if (isUrlLike) {
+      return normalized === normalizedExpected
+    }
+
+    // For filesystem paths, bundlers may emit relative sources.
+    return (
+      normalized === normalizedExpected ||
+      normalized.endsWith(normalizedExpected) ||
+      normalized.endsWith('/' + expectedBasename) ||
+      normalized === expectedBasename
+    )
+  }
+
+  expect(sources.some((s) => matchesExpected(s))).toBe(true)
+
+  // Verify at least one concrete mapping points back to the expected source.
+  let pos = findLineAndColumn(result.css, '.hmt-test')
+  let consumer = await new SourceMapConsumer(raw)
+  try {
+    let original = consumer.originalPositionFor({ line: pos.line, column: pos.column })
+    expect(matchesExpected(original.source)).toBe(true)
+  } finally {
+    ;(consumer as any).destroy?.()
+  }
+}
 
 test("`@import 'tailwindcss'` is replaced with the generated CSS", async () => {
   let processor = postcss([
@@ -48,6 +106,85 @@ test("`@import 'tailwindcss'` is replaced with the generated CSS", async () => {
     parent: expect.any(String),
     plugin: expect.any(String),
   })
+})
+
+test('source maps do not include query params in sources (HMR stable)', async () => {
+  let processor = postcss([
+    tailwindcss({ base: `${__dirname}/fixtures/example-project`, optimize: false }),
+  ])
+
+  // Simulate an HMR cache-busting query param.
+  let fromWithQuery = `${__dirname}/fixtures/example-project/input.css?t=${Date.now()}`
+
+  let result = await processor.process(
+    css`
+      @import 'tailwindcss/utilities';
+
+      .hmt-test {
+        @apply underline;
+      }
+    `,
+    {
+      from: fromWithQuery,
+      map: { inline: false, annotation: false },
+    },
+  )
+
+  await expectMapsBackTo(result, `${__dirname}/fixtures/example-project/input.css`)
+
+  // Ensure the cache-busting param is stripped from the input source.
+  let json = result.map!.toJSON() as RawSourceMap
+  let sources = (json.sources ?? []).map((s) => s.replaceAll('\\', '/'))
+  expect(sources.some((s) => s.includes('t='))).toBe(false)
+})
+
+test('source maps map back to input file (default, no query)', async () => {
+  let processor = postcss([
+    tailwindcss({ base: `${__dirname}/fixtures/example-project`, optimize: false }),
+  ])
+
+  let from = `${__dirname}/fixtures/example-project/input.css`
+
+  let result = await processor.process(
+    css`
+      @import 'tailwindcss/utilities';
+
+      .hmt-test {
+        @apply underline;
+      }
+    `,
+    {
+      from,
+      map: { inline: false, annotation: false },
+    },
+  )
+
+  await expectMapsBackTo(result, from)
+})
+
+test('source maps preserve webpack:// identity (strip only t=)', async () => {
+  let processor = postcss([
+    tailwindcss({ base: `${__dirname}/fixtures/example-project`, optimize: false }),
+  ])
+
+  let from = `webpack://./src/styles/config.css?t=${Date.now()}`
+  let expected = `webpack://./src/styles/config.css`
+
+  let result = await processor.process(
+    css`
+      @import 'tailwindcss/utilities';
+
+      .hmt-test {
+        @apply underline;
+      }
+    `,
+    {
+      from,
+      map: { inline: false, annotation: false },
+    },
+  )
+
+  await expectMapsBackTo(result, expected)
 })
 
 test('output is optimized by Lightning CSS', async () => {

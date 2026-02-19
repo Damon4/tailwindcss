@@ -11,6 +11,8 @@ import { clearRequireCache } from '@tailwindcss/node/require-cache'
 import { Scanner } from '@tailwindcss/oxide'
 import fs from 'node:fs'
 import path, { relative } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { URL } from 'node:url'
 import type { AcceptedPlugin, PluginCreator, Postcss, Root } from 'postcss'
 import { toCss, type AstNode } from '../../tailwindcss/src/ast'
 import { cssAstToPostCssAst, postCssAstToCssAst } from './ast'
@@ -28,6 +30,66 @@ interface CacheEntry {
   fullRebuildPaths: string[]
 }
 const cache = new QuickLRU<string, CacheEntry>({ maxSize: 50 })
+
+function stripQueryParam(id: string, param: string) {
+  let hashIndex = id.indexOf('#')
+  let hash = hashIndex === -1 ? '' : id.slice(hashIndex)
+  let withoutHash = hashIndex === -1 ? id : id.slice(0, hashIndex)
+
+  let queryIndex = withoutHash.indexOf('?')
+  if (queryIndex === -1) return id
+
+  let base = withoutHash.slice(0, queryIndex)
+  let query = withoutHash.slice(queryIndex + 1)
+
+  let parts = query.split('&').filter(Boolean)
+  let filtered = parts.filter((p) => !(p === param || p.startsWith(`${param}=`)))
+
+  return (filtered.length > 0 ? `${base}?${filtered.join('&')}` : base) + hash
+}
+
+function normalizeFromId(from: string) {
+  // Keep bundler schemes + meaningful queries intact, but remove HMR
+  // cache-busting param.
+  return stripQueryParam(from, 't')
+}
+
+function normalizeFsPath(from: string): string {
+  if (!from) return ''
+
+  let normalized = from
+
+  if (/^[a-zA-Z][a-zA-Z+.-]*:\/\//.test(normalized) && !normalized.startsWith('file://')) {
+    // Not a real filesystem path (e.g. webpack://, rspack://). We must not pass
+    // these through path.resolve/fs.stat.
+    return ''
+  }
+
+  if (normalized.startsWith('file://')) {
+    try {
+      let url = new URL(normalized)
+      url.search = ''
+      url.hash = ''
+      normalized = fileURLToPath(url)
+    } catch {
+      // Leave as-is
+      return ''
+    }
+  }
+
+  // Strip query/hash because they are not part of filesystem paths.
+  if (normalized.includes('/') || normalized.includes('\\')) {
+    let hashIndex = normalized.indexOf('#')
+    if (hashIndex !== -1) normalized = normalized.slice(0, hashIndex)
+
+    let queryIndex = normalized.indexOf('?')
+    if (queryIndex !== -1) {
+      normalized = normalized.slice(0, queryIndex)
+    }
+  }
+
+  return normalized
+}
 
 function getContextFromCache(postcss: Postcss, inputFile: string, opts: PluginOptions): CacheEntry {
   let key = `${inputFile}:${opts.base ?? ''}:${JSON.stringify(opts.optimize)}`
@@ -86,10 +148,11 @@ function tailwindcss(opts: PluginOptions = {}): AcceptedPlugin {
         async Once(root, { result, postcss }) {
           using I = new Instrumentation()
 
-          let inputFile = result.opts.from ?? ''
-          let isCSSModuleFile = inputFile.endsWith('.module.css')
+          let inputId = result.opts.from ?? ''
+          let inputFile = normalizeFsPath(inputId)
+          let isCSSModuleFile = (inputFile || inputId).endsWith('.module.css')
 
-          DEBUG && I.start(`[@tailwindcss/postcss] ${relative(base, inputFile)}`)
+          DEBUG && I.start(`[@tailwindcss/postcss] ${relative(base, inputFile || inputId)}`)
 
           // Bail out early if this is guaranteed to be a non-Tailwind CSS file.
           {
@@ -114,8 +177,8 @@ function tailwindcss(opts: PluginOptions = {}): AcceptedPlugin {
             DEBUG && I.end('Quick bail check')
           }
 
-          let context = getContextFromCache(postcss, inputFile, opts)
-          let inputBasePath = path.dirname(path.resolve(inputFile))
+          let context = getContextFromCache(postcss, inputId, opts)
+          let inputBasePath = inputFile ? path.dirname(path.resolve(inputFile)) : base
 
           // Whether this is the first build or not, if it is, then we can
           // optimize the build by not creating the compiler until we need it.
@@ -135,7 +198,7 @@ function tailwindcss(opts: PluginOptions = {}): AcceptedPlugin {
 
             DEBUG && I.start('Create compiler')
             let compiler = await compileAst(ast, {
-              from: result.opts.from,
+              from: result.opts.from ? normalizeFromId(result.opts.from) : result.opts.from,
               base: inputBasePath,
               shouldRewriteUrls,
               onDependency: (path) => context.fullRebuildPaths.push(path),
@@ -177,7 +240,7 @@ function tailwindcss(opts: PluginOptions = {}): AcceptedPlugin {
                 if (message.type !== 'dependency') return []
                 return message.file
               })
-              files.push(inputFile)
+              if (inputFile) files.push(inputFile)
 
               for (let file of files) {
                 let changedTime = fs.statSync(file, { throwIfNoEntry: false })?.mtimeMs ?? null
@@ -238,11 +301,11 @@ function tailwindcss(opts: PluginOptions = {}): AcceptedPlugin {
               DEBUG && I.start('Register dependency messages')
               // Add all found files as direct dependencies
               // Note: With Turbopack, the input file might not be a resolved path
-              let resolvedInputFile = path.resolve(base, inputFile)
+              let resolvedInputFile = inputFile ? path.resolve(base, inputFile) : null
               for (let file of context.scanner.files) {
                 let absolutePath = path.resolve(file)
                 // The CSS file cannot be a dependency of itself
-                if (absolutePath === resolvedInputFile) {
+                if (resolvedInputFile && absolutePath === resolvedInputFile) {
                   continue
                 }
                 result.messages.push({
@@ -330,7 +393,7 @@ function tailwindcss(opts: PluginOptions = {}): AcceptedPlugin {
             root.raws.indent = '  '
             DEBUG && I.end('Update PostCSS AST')
 
-            DEBUG && I.end(`[@tailwindcss/postcss] ${relative(base, inputFile)}`)
+            DEBUG && I.end(`[@tailwindcss/postcss] ${relative(base, inputFile || inputId)}`)
           } catch (error) {
             // An error requires a full rebuild to fix
             context.compiler = null
